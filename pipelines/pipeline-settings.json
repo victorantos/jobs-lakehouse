@@ -1,0 +1,19 @@
+{
+  "_comment": "Reference settings for the jobs-lakehouse pipeline. Free Edition users create the pipeline in the UI (see pipelines/README.md — this file documents exactly which values to pick). CLI users can adapt it for `databricks pipelines create`. Two things matter most: `schema` (NOT the legacy `target`) enables the default publishing mode so fully qualified table names in the source code can publish to jobs_silver AND jobs_gold from this one pipeline; `event_log` publishes the pipeline's event log into Unity Catalog so notebook 03 can query expectation metrics by table name.",
+  "name": "jobs-lakehouse",
+  "serverless": true,
+  "continuous": false,
+  "development": true,
+  "channel": "CURRENT",
+  "catalog": "workspace",
+  "schema": "jobs_silver",
+  "root_path": "/Workspace/<path-to-your-git-folder>/jobs-lakehouse",
+  "libraries": [
+    { "glob": { "include": "/Workspace/<path-to-your-git-folder>/jobs-lakehouse/pipelines/**" } }
+  ],
+  "event_log": {
+    "catalog": "workspace",
+    "schema": "jobs_silver",
+    "name": "_pipeline_event_log"
+  }
+}

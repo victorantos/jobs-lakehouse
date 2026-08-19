@@ -126,21 +126,57 @@ def normalize_and_check() -> None:
         sys.exit(f"{bad} unparseable line(s) — fix the export before committing samples.")
 
 
+# Cross-board pairs to force into the samples so the silver dedupe is
+# demonstrable at sample scale: a plain stride almost never catches BOTH
+# halves of a duplicate pair (500 of 40k rows each side).
+DUP_PAIRS = [("career.computer", "career.solar"), ("career.coffee", "career.computer")]
+DUP_PAIRS_PER_COMBO = 25
+
+
+def _rows_by_url(lines):
+    out = {}
+    for ln in lines:
+        url = json.loads(ln).get("SourceUrl")
+        if url and len(url) > 10:
+            out.setdefault(url.rstrip("/").lower(), ln)
+    return out
+
+
 def cut_samples() -> None:
-    """Deterministic every-Nth-row sample per board (rows are ordered by Id,
-    which is roughly chronological, so a stride gives temporal spread)."""
+    """Deterministic per-board sample: an every-Nth stride (rows are ordered
+    by Id ≈ chronological, so the stride gives temporal spread) PLUS a fixed
+    quota of cross-board duplicate pairs (same SourceUrl on two boards) so
+    the dedupe machinery has something real to find even at sample scale."""
     SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
+    full = {}
     for board in BOARDS:
         files = sorted((EXPORT_DIR / board).glob("*.ndjson"))
-        if not files:
-            print(f"{board}: no export found, skipping")
+        if files:
+            full[board] = [ln for ln in
+                           files[-1].read_text(encoding="utf-8").splitlines() if ln]
+
+    # pick duplicate pairs from the full exports (sorted for determinism)
+    forced = {board: [] for board in full}
+    for a, b in DUP_PAIRS:
+        if a not in full or b not in full:
             continue
-        lines = [ln for ln in files[-1].read_text(encoding="utf-8").splitlines() if ln]
+        by_url_a, by_url_b = _rows_by_url(full[a]), _rows_by_url(full[b])
+        shared = sorted(set(by_url_a) & set(by_url_b))[:DUP_PAIRS_PER_COMBO]
+        forced[a] += [by_url_a[u] for u in shared]
+        forced[b] += [by_url_b[u] for u in shared]
+        print(f"forcing {len(shared)} duplicate pairs {a} <-> {b} into samples")
+
+    for board, lines in full.items():
         stride = max(1, len(lines) // SAMPLE_CAP)
         sample = lines[::stride][:SAMPLE_CAP]
+        seen = {json.loads(ln)["Id"] for ln in sample}
+        extra = [ln for ln in forced[board]
+                 if json.loads(ln)["Id"] not in seen]
+        sample += extra
         out = SAMPLE_DIR / f"{board}.ndjson"
         out.write_text("\n".join(sample) + "\n", encoding="utf-8")
-        print(f"{board}: sampled {len(sample)}/{len(lines)} -> {out.relative_to(REPO)}")
+        print(f"{board}: sampled {len(sample)}/{len(lines)} "
+              f"({len(extra)} forced dup rows) -> {out.relative_to(REPO)}")
 
 
 if __name__ == "__main__":

@@ -167,25 +167,92 @@ What this project uses it for concretely:
   layout. The days of "the ETL job knows the S3 prefix" are over, and that's
   a governance feature, not a convenience.
 
-## 6. Lakeflow Declarative Pipelines vs a chain of notebooks *(stage 2)*
+## 6. Lakeflow Declarative Pipelines vs a chain of notebooks
 
-*To be written when the pipeline exists. The short preview, to be tested
-against reality: you declare tables as functions-returning-DataFrames and the
-framework owns ordering, retries, incrementality and observability — the
-difference between writing MSBuild targets and writing a batch script that
-calls csc.exe in the right order. Also to cover: why the whole medallion flow
-sits in ONE pipeline here (Free Edition allows one active pipeline per type —
-and one DAG is the honest design anyway), and what the migration from
-`import dlt` to the open-sourced Spark Declarative Pipelines API means.*
+A pipeline source file never *runs* anything. Each `@dp.table` /
+`@dp.materialized_view` function returns a DataFrame — an unexecuted query
+plan — and the framework assembles all of them into a dependency graph,
+figures out execution order from who-reads-whom, and owns running it. The
+build-system analogy is exact: notebook chains are a batch script calling
+csc.exe in an order you maintain by hand; a pipeline is MSBuild — you
+declare targets and dependencies, the engine derives the schedule, the
+parallelism, and what's already up to date.
 
-## 7. Expectations — declarative data quality *(stage 2)*
+What the framework owns that a notebook chain makes you own:
 
-*To be written alongside the first real expectation set: warn vs drop vs
-fail semantics, where each belongs (fail = structural invariants that mean
-the pipeline itself is broken; drop = per-row garbage you've decided is
-survivable and want quarantined-by-metric; warn = things you want measured
-before you decide), and how expectation metrics land in the pipeline event
-log as queryable data.*
+- **Ordering & parallelism** — derived from the graph, not from a job
+  step list that silently rots when someone adds a table.
+- **Incrementality** — a streaming table remembers its offsets; a
+  materialized view recomputes (and can incrementally refresh) when inputs
+  change. In notebook-land both are hand-rolled checkpoints and MERGEs.
+- **Retries, rollback, observability** — a failed flow rolls back
+  atomically; every run appends structured events to a queryable log.
+- **DDL lifecycle** — tables are created/evolved from the declaration; no
+  CREATE TABLE scripts drifting from the code that fills them.
+
+The mental shift for someone who has written a lot of imperative ETL: you
+stop writing "steps" and start declaring "states." `postings_current`
+*is* "the latest version of every posting" — not "the result of running the
+merge job after the typed job."
+
+Two project-specific notes:
+- **One pipeline holds silver AND gold** (stage 3 joins the same DAG). Free
+  Edition forces it — one active pipeline per type — but it's also the
+  honest design: one lineage graph from bronze to dashboard, and the default
+  publishing mode's fully-qualified names let one pipeline write to
+  `jobs_silver` and `jobs_gold` schemas.
+- **The API is mid-migration.** `import dlt` (Delta Live Tables) is legacy;
+  the current module is `from pyspark import pipelines as dp` because the
+  framework was open-sourced into Apache Spark as Declarative Pipelines.
+  Some pieces stay Databricks-only (`create_auto_cdc_flow`,
+  `@dp.update_flow`). Worth knowing which is which before an interview.
+
+The CDC step deserves its own line: `dp.create_auto_cdc_flow(target, source,
+keys, sequence_by, stored_as_scd_type=1)` is the declarative replacement for
+the MERGE statement you'd otherwise write, plus the parts you'd get wrong
+first try — late/out-of-order events (sequence_by), and SCD2 history if you
+flip one argument. It's `MERGE ... WHEN MATCHED` as a *contract* instead of
+a statement.
+
+## 7. Expectations — declarative data quality
+
+An expectation is a named boolean SQL expression evaluated per row, with a
+policy for violations. Three policies, three philosophies:
+
+| decorator | on violation | use for |
+|---|---|---|
+| `@dp.expect` (warn) | row kept, counted | **measurement.** Coverage you want trended before you act — e.g. `country_resolved`, `employment_conformed` are our parser-coverage KPIs. |
+| `@dp.expect_or_drop` | row dropped, counted | **survivable per-row garbage.** A salary of €2/year must not poison the marts, but it also must not stop the business. |
+| `@dp.expect_or_fail` | update fails, transaction rolls back | **broken contracts.** A bronze row with no source id means the *export tool* is broken — every further row is suspect, so stop the world while the blast radius is one update. |
+
+The decision rule I'd defend: **fail on things that mean the *system* is
+wrong, drop on things that mean the *row* is wrong, warn on things you're
+still learning about.** Fail is expensive (humans get paged, dashboards go
+stale) — reserve it for invariants where continuing is worse than stopping.
+Drop is cheap but silently shrinks your data — which is why this project
+pairs every drop with a **quarantine table** (`salary_quarantine`
+materialises exactly the rows `salary_facts` rejected, with a reason).
+Drops without a quarantine are counts; drops with one are debuggable.
+
+Two patterns worth naming:
+
+- **Referential checks without subqueries.** Expectation expressions are
+  row-local — no subqueries allowed — so you can't write
+  `currency IN (SELECT ...)`. The idiom: LEFT JOIN the reference table,
+  then `expect_or_drop("fx_rate_known", "usd_rate IS NOT NULL")`. The join
+  makes the missing reference visible as a NULL; the expectation acts on it.
+- **Expectations as metrics.** Every run writes per-expectation pass/fail
+  counts into the event log — a structured Delta table you can publish to
+  Unity Catalog (this project does: `jobs_silver._pipeline_event_log`) and
+  query like any other data. Data quality stops being a screenshot and
+  becomes a time series. Notebook 03 has the exact query.
+
+And one hard-won systems lesson from the fail demo (notebook 03): when a
+fail expectation fires, the rollback protects *silver* — but the offending
+row is already in bronze, permanently, because bronze is append-only. Your
+real choices are the production choices: relax the expectation to a drop
+(weakening the contract), or purge-and-replay from the layer boundary. The
+medallion architecture is what makes the second option cheap.
 
 ## 8. Jobs — orchestration *(stage 4)*
 

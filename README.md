@@ -46,7 +46,7 @@ flowchart LR
 |---|---|---|---|
 | **Landing** (UC volume) | Per-board NDJSON export files | Free Edition restricts outbound network, so extraction runs outside and files arrive here; the volume makes the handoff *governed* | ✅ built |
 | **Bronze** (`jobs_bronze.postings_raw`) | Auto Loader ingests new files exactly-once; everything kept as strings + provenance columns | Replayability: when a silver rule changes, we replay from here instead of re-exporting 7 production DBs | ✅ built |
-| **Silver** (`jobs_silver.*`) | Types, conforms 3 schema generations, dedupes reposts + cross-board duplicates, normalises salary to annual USD, parses locations, explodes skills; expectations on every table | One row = one real-world posting; all interpretation happens here, versioned and tested | 🔜 stage 2 |
+| **Silver** (`jobs_silver.*`) | Lakeflow pipeline: types + conforms 3 schema generations (`postings_typed`), latest-wins CDC per source posting (`postings_current`), duplicate groups + canonical flags (`postings`), skills exploded (`posting_skills`), salaries → annual USD with a quarantine for rejects (`salary_facts` / `salary_quarantine`); expectations on every table incl. fail + drop + referential | One row = one real-world posting; all interpretation happens here, versioned and tested | ✅ built |
 | **Gold** (`jobs_gold.*`) | Postings/vertical/week · salary bands by role/seniority/geo · skill frequency+trend · cross-board duplication rate | Shaped for the dashboard; rebuilt from silver at will | 🔜 stage 3 |
 | **Job** | Bronze ingest task → pipeline update task | One schedule, one DAG, ≤ 5 concurrent tasks (Free Edition cap) | 🔜 stage 4 |
 | **Dashboard** (DBSQL) | One dashboard over gold on the 2X-Small warehouse | The consumption story | 🔜 stage 5 |
@@ -54,8 +54,10 @@ flowchart LR
 ## The data (measured, not invented)
 
 Full export: 109,259 postings (68 MB NDJSON, not committed). Committed
-samples: 3,235 postings (every-Nth stratified per board, ~1.8 MB) so a
-stranger can run the whole pipeline.
+samples: 3,333 postings (~1.8 MB) so a stranger can run the whole pipeline —
+an every-Nth stride per board for temporal spread, plus 50 deliberately
+included cross-board duplicate pairs so the silver dedupe has something
+real to find at sample scale.
 
 | board | rows | schema gen | salary amounts | notes |
 |---|---:|---|---:|---|
@@ -108,7 +110,10 @@ docs, 2026-08 — these change; re-check before copying this design.
 5. **Run `notebooks/02_bronze_autoloader`**. Watch it ingest ~2,250 rows, then read the verify cells — the three-schemas-one-table raggedness is the exhibit.
 6. **Prove exactly-once**: run the write cell again → 0 rows ingested, no new commit in the history cell.
 7. **Prove incrementality**: re-run 01 with `subset=all` (adds 3 boards), re-run 02 → only the new files' ~985 rows are ingested.
-8. *(Data owner only)* Full dataset: `python3 tools/export_postings.py --run` locally (needs `MSSQL_*` env vars + `brew install sqlcmd`), then upload `data/exports/<board>/*.ndjson` into `landing/<board>/` via the volume's Upload button and re-run 02.
+8. **Create the pipeline** (one time): follow `pipelines/README.md` — Jobs & Pipelines → Create → ETL pipeline, source = `pipelines/`, default catalog `workspace` / schema `jobs_silver`, serverless, and paste the `event_log` block from `pipelines/pipeline-settings.json` into Advanced settings.
+9. **Start the pipeline**, watch the DAG light up: bronze → `postings_typed` → `postings_current` → `postings` → `posting_skills` / `salary_facts`.
+10. **Run `notebooks/03_silver_expectations_lab`**: dedupe + conformance verification, expectation metrics from the event log, and the guarded break-it-on-purpose demos (one drop, one pipeline-stopping fail, with recovery).
+11. *(Data owner only)* Full dataset: `python3 tools/export_postings.py --run` locally (needs `MSSQL_*` env vars + `brew install sqlcmd`), then upload `data/exports/<board>/*.ndjson` into `landing/<board>/` via the volume's Upload button and re-run 02 + the pipeline.
 
 ## Design decisions I expect to defend
 
@@ -150,6 +155,28 @@ Partitioning below tens of GB manufactures small files and slows everything;
 Delta's per-file stats already give board-level skipping. (If this grew:
 liquid clustering on `board`, not directory partitioning.)
 
+**Why is silver three tables instead of one query?** Each step is a
+different *kind* of computation: `postings_typed` is row-local (streamable),
+`postings_current` is a keyed upsert (auto CDC), `postings` needs
+cross-row windows (materialized view). Materialising the boundaries makes
+the pipeline graph show the architecture — and each stage restartable on
+its own terms.
+
+**Why `create_auto_cdc_flow` instead of writing a MERGE?** The declarative
+CDC API is the MERGE you'd write plus the parts you'd get wrong first
+try — out-of-order arrivals (`sequence_by`), and SCD2 history if you flip
+one argument. Declaring intent beats maintaining a statement.
+
+**Why does every drop-expectation have a quarantine table?** A dropped row
+that only exists as a metric can't be debugged. `salary_quarantine`
+materialises exactly what `salary_facts` rejected, with a reason column —
+drops stay survivable *and* explainable.
+
+**Why expression builders in `src/conform.py` instead of UDFs?** A Python
+UDF is an opaque per-row callback with serialisation overhead; a composed
+`F.when` chain is an expression tree the optimizer can see and codegen —
+the IQueryable-vs-delegate distinction, applied to Spark.
+
 **Why commit sample data to a portfolio repo?** "A stranger with a fresh
 account can run it end to end" is a requirement; a stranger has no access to
 my databases. 3,235 stratified real rows keep every category of mess
@@ -182,8 +209,12 @@ gitignored).
 ├── notebooks/
 │   ├── 00_setup_unity_catalog.py    schemas + volumes, commented
 │   ├── 01_load_landing.py           samples → landing volume (incremental demo)
-│   └── 02_bronze_autoloader.py      Auto Loader → bronze, verified + documented
-├── pipelines/                       stage 2–3: Lakeflow pipeline source
+│   ├── 02_bronze_autoloader.py      Auto Loader → bronze, verified + documented
+│   └── 03_silver_expectations_lab.py  silver verification + drop/fail demos
+├── pipelines/
+│   ├── silver.py                    the Lakeflow pipeline (silver; gold joins in stage 3)
+│   ├── pipeline-settings.json       reference settings (schema mode, event log → UC)
+│   └── README.md                    create/iterate/refresh guide + DAG table
 └── docs/screenshots/                captured evidence (Free Edition isn't always-on)
 ```
 
@@ -192,7 +223,7 @@ gitignored).
 | stage | deliverable | status |
 |---|---|---|
 | 1 | Export tooling, samples, UC setup, Bronze via Auto Loader | ✅ this commit |
-| 2 | Silver in a Lakeflow Declarative Pipeline, expectations incl. drop + fail demos | 🔜 |
+| 2 | Silver in a Lakeflow Declarative Pipeline, expectations incl. drop + fail demos | ✅ |
 | 3 | Gold marts in the same pipeline | 🔜 |
 | 4 | Scheduled Databricks Job | 🔜 |
 | 5 | DBSQL dashboard + screenshots + final docs | 🔜 |
