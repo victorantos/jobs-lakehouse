@@ -1,0 +1,26 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+
+# --- Local data (never commit full exports; data/samples/ IS committed) ---
+data/exports/
+out/
+
+# --- Secrets / credentials (defense in depth; none should exist in this repo) ---
+.env
+.env.*
+*.pem
+*.key
+
+# --- Databricks CLI / tooling state ---
+.databricks/
+
+# --- Claude Code local permission state (machine-specific) ---
+.claude/settings.local.json
+
+# --- OS / editor noise ---
+.DS_Store
+.vscode/
+.idea/
